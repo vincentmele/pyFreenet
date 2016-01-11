@@ -586,7 +586,7 @@ class FCPNode:
             - dontcompress - do not compress on insert - default false
     
         Keywords for 'file', 'data' and 'redirect' modes:
-            - mimetype - the mime type, default text/plain
+            - mimetype - the mime type, default application/octet-stream
     
         Keywords valid for all modes:
             - async - whether to do the job asynchronously, returning a job ticket
@@ -631,16 +631,21 @@ class FCPNode:
     
         self._log(DETAIL, "put: uri=%s async=%s waituntilsent=%s" % (
                             uri, opts['async'], opts['waituntilsent']))
-    
+
         opts['Persistence'] = kw.pop('persistence', 'connection')
         if kw.get('Global', False):
             opts['Global'] = "true"
         else:
             opts['Global'] = "false"
-    
+        
         if opts['Global'] == 'true' and opts['Persistence'] == 'connection':
             raise Exception("Global requests must be persistent")
     
+
+        if kw.get('Global', False):
+            # listen to the global queue
+            self.listenGlobal()
+
         # process uri, including possible namesite lookups
         uri = uri.split("freenet:")[-1]
         if len(uri) < 4 or (uri[:4] not in ('SSK@', 'KSK@', 'CHK@', 'USK@', 'SVK@')):
@@ -654,7 +659,7 @@ class FCPNode:
             tgtUri = self.namesiteLookup(domain)
             if not tgtUri:
                 raise FCPNameLookupFailure(
-                        "Failed to resolve freenet domain '%s'" % domain)
+                    "Failed to resolve freenet domain '%s'" % domain)
             if rest:
                 uri = (tgtUri + "/" + rest).replace("//", "/")
             else:
@@ -664,10 +669,7 @@ class FCPNode:
         
         # determine a mimetype
         mimetype = kw.get("mimetype", None)
-        if kw.has_key('mimetype'):
-            # got an explicit mimetype - use it
-            mimetype = kw['mimetype']
-        else:
+        if mimetype is None:
             # not explicitly given - figure one out (based on filename)
             ext = os.path.splitext(uri)[1]
             if ext:
@@ -675,17 +677,14 @@ class FCPNode:
                 filename = os.path.basename(uri)
             else:
                 # no CHK@ file extension, try for filename (only in "file" mode)
-                if kw.has_key('file'):
+                if kw.get('file', None) is not None:
                     filename = os.path.basename(kw['file'])
                 else:
-                    # last resort fallback
-                    filename = "foo.txt"
+                    # last resort fallback: use the full uri.
+                    filename = uri
     
             # got some kind of 'filename with extension', convert to mimetype
-            try:
-                mimetype = mimetypes.guess_type(filename)[0] or "text/plain"
-            except:
-                mimetype = "text/plain"
+            mimetype = guessMimetype(filename)
     
         # now can specify the mimetype
         opts['Metadata.ContentType'] = mimetype
@@ -711,7 +710,7 @@ class FCPNode:
             opts['UploadFrom'] = "disk"
             opts['Filename'] = filepath
             if not kw.has_key("mimetype"):
-                opts['Metadata.ContentType'] = mimetypes.guess_type(kw['file'])[0] or "text/plain"
+                opts['Metadata.ContentType'] = guessMimetype(kw['file'])
             # Add a base64 encoded sha256 hash of the file to sidestep DDA
             opts['FileHash'] = base64.encodestring(
                 sha256dda(self.connectionidentifier, id, 
@@ -735,7 +734,18 @@ class FCPNode:
             
     
         opts['timeout'] = int(kw.get("timeout", ONE_YEAR))
-    
+
+        # if the mime-type is application/octet-stream, kill it to
+        # avoid forcing metadata creation
+        mime = opts.get('Metadata.ContentType', None)
+        if mime is not None:
+            if mime == "application/octet-stream":
+                del opts['Metadata.ContentType']
+
+        if "IgnoreUSKDatehints" in kw:
+            opts["IgnoreUSKDatehints"] = kw["IgnoreUSKDatehints"]
+        
+        
         #print "sendEnd=%s" % sendEnd
     
         # ---------------------------------
@@ -829,15 +839,20 @@ class FCPNode:
         else:
             maxConcurrent = 10
         
-        if kw.get('globalqueue', False):
+        if kw.get('globalqueue', False) or kw.get('Global', False):
             globalMode = True
             globalWord = "true"
             persistence = "forever"
+
         else:
             globalMode = False
             globalWord = "false"
             persistence = "connection"
-        
+
+        if kw.get('globalqueue', False) or kw.get('Global', False):
+            # listen to the global queue
+            self.listenGlobal()
+
         id = kw.pop("id", None)
         if not id:
             id = self._getUniqueId()
@@ -883,7 +898,9 @@ class FCPNode:
         
         #@-node:<<get inventory>>
         #@nl
-        
+
+        # FIXME: This somehow works, but it is borked and
+        # repeated. Clean it up. I bet I am the one responsible...
         #@    <<global mode>>
         #@+node:<<global mode>>
         if 0:
@@ -936,20 +953,10 @@ class FCPNode:
                             "PriorityClass=%s" % priority,
                             "URI=%s" % uriFull,
                             "Codecs=%s" % codecs,
-                            #"Persistence=%s" % kw.get("persistence", "connection"),
+                            "Persistence=%s" % persistence,
+                            "Global=%s" % globalWord,
                             "DefaultName=index.html",
                             ]
-                # support global queue option
-                if globalMode:
-                    msgLines.extend([
-                        "Persistence=forever",
-                        "Global=true",
-                        ])
-                else:
-                    msgLines.extend([
-                        "Persistence=connection",
-                        "Global=false",
-                        ])
                 
                 # add each file's entry to the command buffer
                 n = 0
@@ -994,7 +1001,7 @@ class FCPNode:
             log(INFO, "putdir: starting file-by-file inserts")
         
             lastProgressMsgTime = time.time()
-        
+
             # insert each file, one at a time
             nTotal = len(manifest)
         
@@ -1062,7 +1069,7 @@ class FCPNode:
                                chkonly=chkonly,
                                priority=priority,
                                Global=globalMode,
-                               Persistence=persistence,
+                               persistence=persistence,
                                )
                 jobs.append(job)
                 filerec['job'] = job
@@ -1091,20 +1098,10 @@ class FCPNode:
                     "PriorityClass=%s" % priority,
                     "URI=%s" % uriFull,
                     "Codecs=%s" % codecs,
-                    #"Persistence=%s" % kw.get("persistence", "connection"),
+                    "Persistence=%s" % persistence,
+                    "Global=%s" % globalWord,
                     "DefaultName=index.html",
                     ]
-        # support global queue option
-        if kw.get('Global', False):
-            msgLines.extend([
-                "Persistence=forever",
-                "Global=true",
-                ])
-        else:
-            msgLines.extend([
-                "Persistence=connection",
-                "Global=false",
-                ])
         
         # add each file's entry to the command buffer
         n = 0
@@ -1162,9 +1159,10 @@ class FCPNode:
                             id, "ClientPutComplexDir",
                             rawcmd=manifestInsertCmdBuf,
                             async=kw.get('async', False),
+                            Global=globalMode,
+                            persistence=persistence,
                             waituntilsent=kw.get('waituntilsent', False),
                             callback=kw.get('callback', False),
-                            #Persistence=kw.get('Persistence', 'connection'),
                             )
         
         #@-node:<<insert manifest>>
@@ -2102,7 +2100,7 @@ class FCPNode:
         >>> n = fcp.node.FCPNode()
         >>> cmd = "ClientPut"
         >>> jobid = "id2291160822224650"
-        >>> opts = {'Metadata.ContentType': 'text/html', 'async': False, 'UploadFrom': 'direct', 'Verbosity': 0, 'Global': 'false', 'URI': 'CHK@', 'keep': False, 'DontCompress': 'false', 'MaxRetries': -1, 'timeout': 31536000, 'Codecs': 'GZIP, BZIP2, LZMA, LZMA_NEW', 'GetCHKOnly': 'true', 'RealTimeFlag': 'false', 'waituntilsent': False, 'Identifier': jobid, 'Data': '<!DOCTYPE html>\n<html>\n<head>\n<title>Sitemap for freenet-plugin-bare</title>\n</head>\n<body>\n<h1>Sitemap for freenet-plugin-bare</h1>\nThis listing was automatically generated and inserted by freesitemgr\n<br><br>\n<table cellspacing=0 cellpadding=2 border=0>\n<tr>\n<td><b>Size</b></td>\n<td><b>Mimetype</b></td>\n<td><b>Name</b></td>\n</tr>\n<tr>\n<td>19211</td>\n<td>text/html</td>\n<td><a href="index.html">index.html</a></td>\n</tr>\n</table>\n<h2>Keys of large, separately inserted files</h2>\n<pre>\n</pre></body></html>\n', 'PriorityClass': 3, 'Persistence': 'connection', 'TargetFilename': 'sitemap.html'}
+        >>> opts = {'Metadata.ContentType': 'text/html', 'async': False, 'UploadFrom': 'direct', 'Verbosity': 0, 'Global': 'false', 'URI': 'CHK@', 'keep': False, 'DontCompress': 'false', 'MaxRetries': -1, 'timeout': 31536000, 'Codecs': 'GZIP, BZIP2, LZMA, LZMA_NEW', 'GetCHKOnly': 'true', 'RealTimeFlag': 'false', 'waituntilsent': False, 'Identifier': jobid, 'Data': '<!DOCTYPE html>\\n<html>\\n<head>\\n<title>Sitemap for freenet-plugin-bare</title>\\n</head>\\n<body>\\n<h1>Sitemap for freenet-plugin-bare</h1>\\nThis listing was automatically generated and inserted by freesitemgr\\n<br><br>\\n<table cellspacing=0 cellpadding=2 border=0>\\n<tr>\\n<td><b>Size</b></td>\\n<td><b>Mimetype</b></td>\\n<td><b>Name</b></td>\\n</tr>\\n<tr>\\n<td>19211</td>\\n<td>text/html</td>\\n<td><a href="index.html">index.html</a></td>\\n</tr>\\n</table>\\n<h2>Keys of large, separately inserted files</h2>\\n<pre>\\n</pre></body></html>\\n', 'PriorityClass': 3, 'Persistence': 'connection', 'TargetFilename': 'sitemap.html'}
         >>> n._submitCmd(jobid, cmd, **opts)
         'CHK@FR~anQPhpw7lZjxl96o1b875tem~5xExPTiSa6K3Wus,yuGOWhpqFY5N9i~N4BjM0Oh6Bk~Kkb7sE4l8GAsdBEs,AAMC--8/sitemap.html'
         >>> # n._submitCmd(id=None, cmd='WatchGlobal', **{'Enabled': 'true'})
@@ -2138,7 +2136,7 @@ class FCPNode:
         if cmd == 'ClientGet' and 'URI' in kw:
             job.uri = kw['URI']
     
-        if cmd == 'ClientPut':
+        if cmd == 'ClientPut' and 'Metadata.ContentType' in kw:
             job.mimetype = kw['Metadata.ContentType']
     
         self.clientReqQueue.put(job)
@@ -2908,8 +2906,8 @@ class JobTicket:
         self.followRedirect = opts.get('followRedirect', False)
     
         # find out if persistent
-        if kw.get("Persistent", "connection") != "connection" \
-        or kw.get("PersistenceType", "connection") != "connection":
+        if (kw.get("Persistent", "connection") != "connection" or
+            kw.get("PersistenceType", "connection") != "connection"):
             self.isPersistent = True
         else:
             self.isPersistent = False
@@ -2959,7 +2957,7 @@ class JobTicket:
         log(DEBUG, "wait:%s:%s: timeout=%ss" % (self.cmd, self.id, timeout))
     
         # wait forever for job to complete, if no timeout given
-        if timeout == None:
+        if timeout is None:
             log(DEBUG, "wait:%s:%s: no timeout" % (self.cmd, self.id))
             while not self.lock.acquire(False):
                 time.sleep(_pollInterval)
@@ -3039,6 +3037,7 @@ class JobTicket:
         If result is an exception object, then raises it
         """
         if isinstance(self.result, Exception):
+            self.node.shutdown()
             raise self.result
         else:
             return self.result
@@ -3176,14 +3175,24 @@ def readdir(dirpath, prefix='', gethashes=False):
       - mimetype - guestimated mimetype for file
 
     >>> tempdir = tempfile.mkdtemp()
-    >>> testfile = os.path.join(tempdir, "test")
+    >>> filename = "test.txt"
+    >>> testfile = os.path.join(tempdir, filename)
     >>> with open(testfile, "w") as f:
     ...     f.write("test")
-    >>> correct = [{'mimetype': 'text/plain', 'fullpath': os.path.join(tempdir, 'test'), 'relpath': 'test'}]
+    >>> correct = [{'mimetype': 'text/plain', 'fullpath': testfile, 'relpath': filename}]
+    >>> correct == readdir(tempdir)
+    True
+    >>> tempdir = tempfile.mkdtemp()
+    >>> filename = "test"
+    >>> testfile = os.path.join(tempdir, filename)
+    >>> with open(testfile, "w") as f:
+    ...     f.write("test")
+    >>> correct = [{'mimetype': 'application/octet-stream', 'fullpath': testfile, 'relpath': filename}]
     >>> correct == readdir(tempdir)
     True
     >>> res = readdir(tempdir, gethashes=True)
-    >>> res[0]["hash"] = hashFile(testfile)
+    >>> res[0]["hash"] == hashFile(testfile)
+    True
     """
     
     #set_trace()
@@ -3254,9 +3263,13 @@ def guessMimetype(filename):
     if filename.endswith(".tar.bz2"):
         return ('application/x-tar', 'bzip2')
     
-    m = mimetypes.guess_type(filename, False)[0]
-    if m == None:
-        m = "text/plain"
+    try:
+        m = mimetypes.guess_type(filename, False)[0]
+    except:
+        m = None
+    if m is None: # either an exception or a genuine None
+        # FIXME: log(INFO, "Could not find mimetype for filename %s" % filename)
+        m = "application/octet-stream"
     return m
 
 

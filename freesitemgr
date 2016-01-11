@@ -10,6 +10,7 @@ A utility to update freesites from within a cron environment
 #@+others
 #@+node:imports
 import sys, os, time, commands, traceback, getopt
+import os.path
 
 import fcp.node
 from fcp.sitemgr import SiteMgr, fixUri, defaultMaxManifestSizeBytes, defaultMaxNumberSeparateFiles
@@ -92,11 +93,14 @@ def editCreateConfig(sitemgr):
 
 #@-node:editCreateConfig
 #@+node:addSite
-def addSite(sitemgr):
+def addSite(sitemgr, sitepath=None):
     """
     Interactively adds a new site to config
     """
-    print "Add new site"
+    if sitepath:
+        print "Add new site for path %s" % sitepath
+    else:
+        print "Add new site"
     
     if not sitemgr.node:
         print "Cannot add site - no contact with node on %s:%s" % (
@@ -104,29 +108,38 @@ def addSite(sitemgr):
         print "Please ensure your freenet node is running, or run"
         print "'%s setup' to edit your FCP access address" % progname
 
-    while 1:
-        sitename = raw_input("Name of freesite, or empty line to cancel: ").strip()
-        if not sitename:
-            print "Add site aborted"
-            return
-        elif sitemgr.hasSite(sitename):
-            print "Freesite '%s' already exists" % sitename
-            continue
-        break
-
-    while 1:
-        sitedir = raw_input("Directory where freesite's files reside: ").strip()
-        if not sitedir:
-            print "Add site aborted"
-            return
-        sitedir = os.path.abspath(sitedir)
-        if not os.path.isdir(sitedir):
-            print "'%s' is not a directory, try again" % sitedir
-            continue
-        # elif not os.path.isfile(os.path.join(sitedir, sitemgr.index)):
-        #     print "'%s' has no %s, try again" % (sitedir, sitemgr.index)
-        #     continue
-        break
+    if sitepath:
+        sitepathabs = os.path.abspath(sitepath)
+        sitepathname = os.path.basename(sitepathabs)
+    if sitepath and os.path.isdir(sitepathabs) and not sitemgr.hasSite(sitepathname):
+        sitename, sitedir = sitepathname, sitepathabs
+        print "Using sitename %s and path %s" % (sitename, sitedir)
+    else:
+        if sitepath:
+            print "The argument is not a valid site path."
+        while 1:
+            sitename = raw_input("Name of freesite, or empty line to cancel: ").strip()
+            if not sitename:
+                print "Add site aborted"
+                return
+            if sitemgr.hasSite(sitename):
+                print "Freesite '%s' already exists" % sitename
+                continue
+            break
+    
+        while 1:
+            sitedir = raw_input("Directory where freesite's files reside: ").strip()
+            if not sitedir:
+                print "Add site aborted"
+                return
+            sitedir = os.path.abspath(sitedir)
+            if not os.path.isdir(sitedir):
+                print "'%s' is not a directory, try again" % sitedir
+                continue
+            # elif not os.path.isfile(os.path.join(sitedir, sitemgr.index)):
+            #     print "'%s' has no %s, try again" % (sitedir, sitemgr.index)
+            #     continue
+            break
 
     while 1:
         uriPriv = raw_input("Site private URI (if any - press ENTER for new\n: ").strip()
@@ -147,9 +160,10 @@ def addSite(sitemgr):
         uriPriv = fixUri(uriPriv, sitename)
 
     # good to go - add the site
-    sitemgr.addSite(name=sitename, dir=sitedir, uriPub=uriPub, uriPriv=uriPriv)
+    site = sitemgr.addSite(name=sitename, dir=sitedir, uriPub=uriPub, uriPriv=uriPriv)
 
-    print "Added new freesite: '%s' => %s" % (sitename, sitedir)
+    print "Added new freesite: '%s' => %s" % (site.name, sitedir)
+    return site.name
 
 #@-node:addSite
 #@+node:removeSite
@@ -161,7 +175,7 @@ def removeSite(sitemgr, sitename):
         print "No such freesite '%s'" % sitename
         return
 
-    if getyesno("Are you sure you wish to delete freesite '%s'" % sitename, False):
+    if getyesno("Are you sure you wish to delete the configuration (metadata and keys) for freesite '%s'" % sitename, False):
         sitemgr.removeSite(sitename)
         print "Removed freesite '%s'" % sitename
 
@@ -247,6 +261,8 @@ def help():
     print "          - run verbosely, use multiple times for even more noise"
     print "  -q, --quiet"
     print "          - run quietly"
+    print "  -n, --no-update"
+    print "          - do not update the site after adding it (only for add)"
     print "  -i, --index"
     print "          - index file (default is index.html)"
     print "  -m, --mime-type"
@@ -254,8 +270,7 @@ def help():
     print "  -l, --logfile=filename"
     print "          - location of logfile (default %s)" % logFile
     print "  -r, --priority"
-    print "     Set the priority (0 highest, 6 lowest, default 4)"
-    print "     of 'forever', so the insert will resume if the node crashes"
+    print "     Set the priority (0 highest, 6 lowest, default 3)"
     print "  -C, --cron"
     print "     Set options suitable for putting freesitemgr in your crontab,"
     print "     and output a dated header with each site insert"
@@ -270,6 +285,7 @@ def help():
     print "  --chk-calculation-node=hostname[:port]"
     print "     Use a different node for CHK calculations, which can be a"
     print "     timesaver when inserting large amounts of data into a remote node"
+    print "     (port defaults to %s)" % fcp.node.defaultFCPPort
     print
     print "Available Commands:"
     print "  setup              - create/edit freesite config file interactively"
@@ -278,7 +294,7 @@ def help():
     print "  list [<name>]      - display a summary of all freesites, or a"
     print "                       detailed report of one site if <name> given"
     print "  listall            - print detailed report of all sites"
-    print "  remove <name>      - remove given freesite"
+    print "  remove <name>      - remove metadata and keys for given freesite"
     print "  update [<name>...] - reinsert freesites which have changed since"
     print "                       they were last inserted. If no site names are"
     print "                       given, then all freesites will be updated"
@@ -321,16 +337,17 @@ def main():
             "verbosity" : fcp.node.ERROR,
             "Verbosity" : 0,
             #"logfile" : logFile,
-            'priority' : 3,
+            "priority"  : 3,
+            "update-after-add"    : True
             }
 
     # process command line switches
     try:
         cmdopts, args = getopt.getopt(
             sys.argv[1:],
-	    "?hvc:l:r:fCVi:m:",
+	    "?hvc:l:r:qfnCVi:m:",
             ["help", "verbose", "config-dir=", "logfile=",
-             "max-concurrent=", "force",
+             "max-concurrent=", "quiet", "force", "no-update",
              "priority", "cron",
              "chk-calculation-node=", "max-manifest-size=",
              "version", "index", "mime-type",
@@ -359,6 +376,9 @@ def main():
         
         if o in ("-q", "--quiet"):
             opts['verbosity'] = fcp.node.SILENT
+        
+        if o in ("-n", "--no-update"):
+            opts['update-after-add'] = False
         
         if o in ("-c", "--config-dir"):
             opts['basedir'] = a
@@ -427,7 +447,26 @@ def main():
     elif cmd == 'add':
         if not sitemgr.node:
             noNodeError(sitemgr, "Cannot add site")
-        addSite(sitemgr)
+        if args:
+            sitepath = args[0]
+            sitename = addSite(sitemgr, sitepath)
+        else:
+            sitename = addSite(sitemgr)
+    
+        if opts["update-after-add"]: 
+            # renew sitemgr, then update 
+            # FIXME: Move the whole if-elif-else into a function to
+            # make it clear that nothing spills out.
+            try:
+                sitemgr.node.shutdown()
+            except:
+                try:
+                    sitemgr.node.socket.close()
+                except:
+                    pass
+                pass
+            sitemgr = SiteMgr(**opts)
+            sitemgr.insert(sitename, cron=cron)
 
     elif cmd == 'remove':
         if not args:
